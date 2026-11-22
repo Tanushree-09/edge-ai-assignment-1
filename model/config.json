@@ -25,5 +25,6 @@
     "wifi_rssi_dbm",
     "age_months"
   ],
-  "val_mae": 4.59
+  "val_mae": 3.79,
+  "log_target": true
 }
