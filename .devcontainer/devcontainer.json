@@ -2,7 +2,6 @@
   "name": "Edge AI Assignment 1 - Battery API",
   "image": "mcr.microsoft.com/devcontainers/python:3.11",
   "postCreateCommand": "pip install -r requirements.txt",
-  "postStartCommand": "nohup python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 > /tmp/uvicorn.log 2>&1 &",
   "forwardPorts": [8000],
   "portsAttributes": {
     "8000": { "label": "battery-api", "onAutoForward": "notify", "visibility": "public" }
