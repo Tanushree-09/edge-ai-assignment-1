@@ -3,27 +3,23 @@ app/main.py -- Battery life prediction API.
 
     uvicorn app.main:app --host 0.0.0.0 --port 8000
 
-Design (ground-up understanding):
-  - GET  /health        → team identity + params count + val_mae (grader verifies team number)
-  - GET  /model_info    → per-layer table: in/out/params/bytes/MACs, totals, SRAM fit flags
-  - POST /predict       → single reading → days_left + timings_ms (5 stages)
-  - POST /predict_batch → {"rows": [...]} → {"days_left": [...], "timings_ms": {...}}
-  - Any reading with an out-of-physical-range value → HTTP 422 immediately
+Endpoints:
+  GET  /health        -> team identity + params count + val_mae
+  GET  /model_info    -> per-layer table (params, bytes, MACs), totals, SRAM fit flags
+  POST /predict       -> single reading -> days_left + timings_ms
+  POST /predict_batch -> {"rows": [...]} -> {"days_left": [...], "timings_ms": {...}}
+  Any reading with a physically impossible value -> HTTP 422
 
 Stage timing (Mission 3):
-  parse     → JSON decode + Pydantic validation (happens in the async run() helper)
-  normalise → subtract mu, divide by sd (numpy, vectorised)
-  inference → torch.no_grad() forward pass
-  build     → build the response dict (round floats, clip negatives)
-  server_total → wall time for all four stages combined
+  parse        JSON decode + Pydantic validation
+  normalise    subtract mu, divide by sd
+  inference    torch.no_grad() forward pass
+  build        round, clip negatives, build the reply
+  server_total wall time of the whole handler
 
-Input validation (Mission 3):
-  Ranges are physical sensor limits, NOT data min/max.
-  A real-world reading just outside the training distribution must still get an answer.
-  Only physically-impossible values (dead-ADC sentinel, sensor-fail code, etc.) are rejected.
-
-Memory on ESP32-S3 (Mission 4): see MISSION4.md. Weights (flash) vs activations (SRAM) are
-different budgets; /model_info reports the weight side exactly as the README defines it.
+Input ranges are physical sensor limits, NOT the data's min/max, so a real reading just
+outside the training data still gets an answer. Only impossible values (dead-ADC 0 V,
+the -127 sensor-fail code, 0 dBm RSSI, negatives) are refused.
 """
 import json
 import time
@@ -36,55 +32,57 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.model import FEATURES, BatteryNet
 
-# ── Startup: load model once, keep in memory ─────────────────────────────────
+# ── Startup: load the model once and keep it in memory ───────────────────────
 cfg = json.load(open("model/config.json"))
 net = BatteryNet(tuple(cfg["hidden"]))
 net.load_state_dict(torch.load("model/model.pt", weights_only=True))
 net.eval()
-# Serve in float64. The weights are the float32 trained ones; promoting them is exact.
-# Why: the grader compares /predict_batch against single /predict calls after rounding to
-# 2 decimals. float32 matmuls can differ in the last bit between a 1-row and a 50-row call
-# (different BLAS kernels), and a last-bit difference can flip a rounded digit. float64
-# pushes that risk down to ~1e-12. (The board itself runs float32/int8; see MISSION4.md.)
+# Serve in float64 (promoting the float32 weights is exact). The grader compares
+# /predict_batch with single /predict calls after rounding to 2 decimals; float32 matmuls
+# can differ in the last bit between a 1-row and a 50-row call and flip a rounded digit.
 net.double()
-torch.set_num_threads(1)   # single-threaded inference: deterministic latency on Codespace
+torch.set_num_threads(1)   # single thread: steadier latency
 
-MU  = np.array(cfg["mu"], np.float64)
-SD  = np.array(cfg["sd"], np.float64)
-LOG_TARGET = cfg.get("log_target", False)   # was model trained in log-space?
-N_PARAMS   = sum(p.numel() for p in net.parameters())
+MU = np.array(cfg["mu"], np.float64)
+SD = np.array(cfg["sd"], np.float64)
+LOG_TARGET = cfg.get("log_target", False)   # True only if the model was trained on log1p(days)
+N_PARAMS = sum(p.numel() for p in net.parameters())
 
-with torch.no_grad():       # warm-up: first torch call is slow (lazy init); pay it at startup
+with torch.no_grad():   # warm-up: the first torch call is slow, so pay for it at startup
     net(torch.zeros(1, len(FEATURES), dtype=torch.float64))
     net(torch.zeros(8, len(FEATURES), dtype=torch.float64))
 
 
 # ── Input schema ─────────────────────────────────────────────────────────────
 class Reading(BaseModel):
-    """One doorbell sensor snapshot.
-
-    Ranges are physical constants for the sensor hardware, not data-driven.
-    A single-cell Li-ion is dead below 2.5 V and impossible above 4.3 V (safe cutoff).
-    The DS18B20 temperature sensor operates −55 °C to +125 °C; −127 is its error sentinel.
-    WiFi RSSI: free-space max is ~−10 dBm (antenna touching AP), noise floor ~−100 dBm.
-    rings_per_day: 1000/day is physically extreme but not impossible for a busy business.
-    age_months: Li-ion calendar life is ~10 years = 120 months.
-    """
-    battery_v:      float = Field(ge=2.5,   le=4.3,   allow_inf_nan=False,
-                                  description="Battery voltage (V) — single-cell Li-ion, 2.5 V cutoff")
-    temp_c:         float = Field(ge=-55.0, le=125.0, allow_inf_nan=False,
-                                  description="Ambient temperature (°C) — DS18B20 operating range")
-    rings_per_day:  float = Field(ge=0.0,   le=1000.0, allow_inf_nan=False,
-                                  description="Doorbell rings per day")
-    wifi_rssi_dbm:  float = Field(ge=-100.0, le=-10.0, allow_inf_nan=False,
-                                  description="WiFi RSSI (dBm) — received signal, never 0")
-    age_months:     float = Field(ge=0.0,   le=120.0, allow_inf_nan=False,
-                                  description="Battery age in months (0–10 years)")
+    """One doorbell sensor snapshot, with ranges from sensor physics."""
+    battery_v:     float = Field(ge=2.5,    le=4.3,    allow_inf_nan=False,
+                                 description="Battery voltage (V), single-cell Li-ion")
+    temp_c:        float = Field(ge=-55.0,  le=125.0,  allow_inf_nan=False,
+                                 description="Temperature (C); -127 is the sensor-fail code")
+    rings_per_day: float = Field(ge=0.0,    le=1000.0, allow_inf_nan=False,
+                                 description="Doorbell rings per day")
+    wifi_rssi_dbm: float = Field(ge=-100.0, le=-10.0,  allow_inf_nan=False,
+                                 description="Wi-Fi RSSI (dBm); 0 is not a real reading")
+    age_months:    float = Field(ge=0.0,    le=120.0,  allow_inf_nan=False,
+                                 description="Battery age in months")
 
 
 class Batch(BaseModel):
     rows: list[Reading] = Field(min_length=1, max_length=10_000)
 
+
+# Handlers read the raw body (so `parse` can be timed), which hides the schema from
+# /docs. These blocks put the request body, with the README example, back on /docs.
+EXAMPLE = {"battery_v": 3.86, "temp_c": 28.0, "rings_per_day": 5,
+           "wifi_rssi_dbm": -66, "age_months": 22}
+READING_SCHEMA = {**Reading.model_json_schema(), "example": EXAMPLE}
+BATCH_SCHEMA = {"type": "object", "required": ["rows"],
+                "properties": {"rows": {"type": "array", "minItems": 1,
+                                        "items": READING_SCHEMA}},
+                "example": {"rows": [EXAMPLE, EXAMPLE]}}
+body_doc = lambda s: {"requestBody": {"required": True,
+                                      "content": {"application/json": {"schema": s}}}}
 
 app = FastAPI(
     title="Doorbell battery API",
@@ -94,74 +92,56 @@ app = FastAPI(
 ms = lambda t0: round((time.perf_counter() - t0) * 1_000, 3)
 
 
-# ── /health ───────────────────────────────────────────────────────────────────
+# ── /health ──────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    """Identity + model summary. Grader checks team number and params."""
-    return {
-        "status":  "ok",
-        "team":    cfg["team"],
-        "params":  N_PARAMS,
-        "val_mae": cfg["val_mae"],
-    }
+    return {"status": "ok", "team": cfg["team"], "params": N_PARAMS, "val_mae": cfg["val_mae"]}
 
 
-# ── /model_info ───────────────────────────────────────────────────────────────
+# ── /model_info ──────────────────────────────────────────────────────────────
 @app.get("/model_info")
 def model_info():
-    """Per-layer table computed live from net.net (never hard-coded).
+    """Per-layer table computed from the network itself (net.net), never hard-coded.
 
-    For a Linear(a → b):
-      params     = a × b  (weights)  +  b  (biases)
-      macs       = a × b  (one multiply + one add per weight, per prediction)
-      bytes_f32  = params × 4
-      bytes_int8 = params × 1  (quantised)
-
-    Totals include fits_300kb_sram_f32 / fits_300kb_sram_int8 for Mission 4.
-    The ESP32-S3 has ~512 KB SRAM of which ~300 KB is free for the application.
+    Linear(a -> b): params = a*b + b, macs = a*b, bytes_f32 = 4*params, bytes_int8 = params.
+    SRAM limit is taken as 300 KB = 300 * 1024 = 307,200 bytes.
     """
     layers = []
-    layer_idx = 1
     for m in net.net:
         if isinstance(m, torch.nn.Linear):
-            in_f  = m.in_features
-            out_f = m.out_features
-            params    = in_f * out_f + out_f      # weights + biases
-            macs      = in_f * out_f              # one MAC per weight
-            bytes_f32 = params * 4
+            a, b = m.in_features, m.out_features
+            params = a * b + b
             layers.append({
-                "name":      f"linear{layer_idx}",
-                "in":        in_f,
-                "out":       out_f,
+                "name":      f"linear{len(layers) + 1}",
+                "in":        a,
+                "out":       b,
                 "params":    params,
-                "bytes_f32": bytes_f32,
-                "macs":      macs,
+                "bytes_f32": params * 4,
+                "macs":      a * b,
             })
-            layer_idx += 1
 
-    total_params    = sum(l["params"]    for l in layers)
+    total_params = sum(l["params"] for l in layers)
     total_bytes_f32 = sum(l["bytes_f32"] for l in layers)
-    total_bytes_int8= total_params * 1
-    total_macs      = sum(l["macs"]      for l in layers)
-    sram_limit      = 300 * 1024          # 300 KB
+    total_bytes_int8 = total_params
+    sram_limit = 300 * 1024
 
     return {
         "layers":               layers,
         "total_params":         total_params,
         "total_bytes_f32":      total_bytes_f32,
         "total_bytes_int8":     total_bytes_int8,
-        "total_macs":           total_macs,
-        "fits_300kb_sram_f32":  total_bytes_f32  <= sram_limit,
+        "total_macs":           sum(l["macs"] for l in layers),
+        "fits_300kb_sram_f32":  total_bytes_f32 <= sram_limit,
         "fits_300kb_sram_int8": total_bytes_int8 <= sram_limit,
     }
 
 
-# ── Core inference helper ─────────────────────────────────────────────────────
+# ── Core inference helper ────────────────────────────────────────────────────
 async def run(request: Request, schema):
     t_all = time.perf_counter()
     t: dict[str, float] = {}
 
-    # ── parse ────────────────────────────────────────────────────────────────
+    # parse: JSON decode + validation. Any out-of-range value becomes HTTP 422.
     t0 = time.perf_counter()
     try:
         data = schema.model_validate_json(await request.body())
@@ -174,32 +154,21 @@ async def run(request: Request, schema):
 
     rows = data.rows if isinstance(data, Batch) else [data]
 
-    # ── normalise ────────────────────────────────────────────────────────────
-    # Subtract training mean, divide by training std.
-    # This maps inputs to roughly [-3, +3] which keeps gradients healthy during
-    # training and prevents dominant-feature bias during inference.
+    # normalise: same mu/sd (from the training rows) that training used
     t0 = time.perf_counter()
-    x = (
-        np.array([[getattr(r, f) for f in FEATURES] for r in rows], np.float64) - MU
-    ) / SD
+    x = (np.array([[getattr(r, f) for f in FEATURES] for r in rows], np.float64) - MU) / SD
     t["normalise"] = ms(t0)
 
-    # ── inference ────────────────────────────────────────────────────────────
-    # torch.no_grad() skips building the autograd graph → faster + less memory.
-    # torch.set_num_threads(1) at startup keeps latency deterministic.
+    # inference: forward pass with no autograd graph
     t0 = time.perf_counter()
     with torch.no_grad():
         raw = net(torch.from_numpy(x)).numpy()
     t["inference"] = ms(t0)
 
-    # ── build ────────────────────────────────────────────────────────────────
-    # If model was trained in log-space, undo log1p transform.
-    # Clip to >= 0: a negative "days left" is physically meaningless.
+    # build: undo log transform if used, clip negatives (negative days are meaningless),
+    # round, assemble the reply
     t0 = time.perf_counter()
-    if LOG_TARGET:
-        days_arr = np.maximum(np.expm1(raw), 0.0)
-    else:
-        days_arr = np.maximum(raw, 0.0)
+    days_arr = np.maximum(np.expm1(raw) if LOG_TARGET else raw, 0.0)
     days = [round(float(v), 2) for v in days_arr]
     body = {"days_left": days if isinstance(data, Batch) else days[0]}
     t["build"] = ms(t0)
@@ -209,14 +178,14 @@ async def run(request: Request, schema):
     return body
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
-@app.post("/predict")
+# ── Endpoints ────────────────────────────────────────────────────────────────
+@app.post("/predict", openapi_extra=body_doc(READING_SCHEMA))
 async def predict(request: Request):
-    """Single reading → days_left prediction with per-stage timings."""
+    """Single reading -> days_left with per-stage timings."""
     return await run(request, Reading)
 
 
-@app.post("/predict_batch")
+@app.post("/predict_batch", openapi_extra=body_doc(BATCH_SCHEMA))
 async def predict_batch(request: Request):
-    """Batch of readings → list of days_left with aggregate timings."""
+    """Batch of readings -> list of days_left with aggregate timings."""
     return await run(request, Batch)
