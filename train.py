@@ -5,21 +5,27 @@ train.py -- Clean the data, fit baselines, train the network, save it for the se
 Writes model/model.pt and model/config.json, which app/main.py loads
 (--out DIR writes somewhere else, --seed N changes the init; see MISSION4.md for the 3-seed comparison).
 
-Design decisions:
-  1. Glitch rules: physical impossibility rules, not data-min/max clipping.
-     battery_v=0 → dead ADC; temp=-127 → failed sensor sentinel; wifi=0 → no reading.
-  2. Normalisation: mu/sd from TRAINING rows only. Validation is held-out future data —
-     using its statistics would leak information and give optimistic metrics.
-     mu/sd are saved in config.json because the device must apply the same two numbers per
-     feature (training/serving skew is the classic edge bug).
-  3. Log-space target (--log-target): days_left is right-skewed (p50=51, max=322). Training on
-     log(days_left+1) balances urgent low-battery cases against rare 300-day readings.
+Design decisions (class citations from adithyamd.com/courses/edge-ai):
+  1. [Class 5, 10] Glitch rules: physical impossibility rules, NOT data-min/max clipping.
+     battery_v < 2.5 V = dead Li-ion (datasheet cutoff), not "below training min".
+     temp_c < -40 °C = DS18B20 failure sentinel; wifi_rssi >= -10 dBm = impossible received signal.
+     "Never a guess when the input is physically impossible." (Class 5: graceful degradation)
+     "Use datasheet ranges, not data ranges." (Class 10)
+  2. [Class 6, 19] Normalisation: mu/sd from TRAINING rows only. Validation simulates unseen data.
+     mu/sd are saved in config.json so the device applies the SAME two numbers per feature.
+     Training/serving skew — using different scaling on the board vs in training — is the
+     classic edge bug. (Class 6). Normalisation prevents dominant-feature bias when feature
+     scales differ by orders of magnitude (Class 19).
+  3. [Class 15] Log-space target (--log-target): days_left is right-skewed (p50=51, max=322).
+     Training on log1p(days_left) balances urgent low-battery cases against rare 300-day readings.
      The server/board must undo it with expm1 and clip at 0 (recorded as log_target in config.json).
-  4. Cosine-annealing LR; the best checkpoint (validation MAE, checked every 50 epochs) is kept.
+     "The estimate is a placeholder, not the answer." — we measure train MAE vs val MAE every 50
+     epochs to understand the overfitting gap (Class 15: compare train vs val, understand the gap).
+  4. [Class 15] Cosine-annealing LR; the best checkpoint (validation MAE, checked every 50 epochs).
      No early stopping: the best weights arrive late, when the learning rate is small.
   5. L2 weight decay (1e-5): light regularisation to prevent overfitting on 1976 rows.
-  6. The model is intentionally small (385 params, 1.5 KB as float32) so it fits the ESP32-S3
-     with room to spare.
+  6. [Class 4, 7] The model is intentionally small (385 params, 1.5 KB as float32) so it fits the
+     ESP32-S3 with room to spare. Weights live in flash; activations in SRAM (Class 7).
 """
 import argparse
 import json
